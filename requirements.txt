@@ -1,0 +1,6 @@
+evdev
+python-uinput
+pyyaml
+faster-whisper
+sounddevice
+numpy
