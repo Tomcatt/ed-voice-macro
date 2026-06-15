@@ -3,81 +3,109 @@
 ED Voice+Macro Daemon
 Gauss stagger autofire + voice commands for Elite Dangerous VR
 
-Autofire logic:
-  - User holds physical trigger → ED reads it directly and starts charging group 1
-  - Daemon cycles fire groups every charge_hold_ms
-  - Each cycle: group fires (charge complete), next group immediately starts charging
-  - Release trigger → daemon stops cycling, ED stops firing
-  - Net result: 3 Gauss groups fire in rotation with no gap
+Config:  ~/.config/ed-voice-macro/app.yaml
+Profile: ~/.config/ed-voice-macro/profiles/<name>.yaml
+Active:  ~/.config/ed-voice-macro/active_profile  (one line, hot-swappable)
 """
 import asyncio
 import logging
 import signal
+import shutil
+from pathlib import Path
+
 import yaml
 import evdev
 from evdev import ecodes
 import uinput
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("ed-macro")
 
+CONFIG_DIR         = Path.home() / ".config" / "ed-voice-macro"
+APP_CONFIG_PATH    = CONFIG_DIR / "app.yaml"
+PROFILES_DIR       = CONFIG_DIR / "profiles"
+ACTIVE_PROFILE_PATH = CONFIG_DIR / "active_profile"
 
-def load_config(path="config.yaml"):
+
+# ---------------------------------------------------------------------------
+# Config loading
+# ---------------------------------------------------------------------------
+
+def load_app_config() -> dict:
+    with open(APP_CONFIG_PATH) as f:
+        return yaml.safe_load(f)
+
+
+def load_profile(name: str) -> dict:
+    path = PROFILES_DIR / f"{name}.yaml"
+    if not path.exists():
+        raise FileNotFoundError(f"Profile not found: {path}")
     with open(path) as f:
         return yaml.safe_load(f)
 
 
+def read_active_profile_name() -> str:
+    return ACTIVE_PROFILE_PATH.read_text().strip()
+
+
+# ---------------------------------------------------------------------------
+# Virtual keyboard (uinput)
+# ---------------------------------------------------------------------------
+
+KEY_MAP = {
+    "KEY_RIGHTBRACE": uinput.KEY_RIGHTBRACE,
+    "KEY_LEFTBRACE":  uinput.KEY_LEFTBRACE,
+    "KEY_TAB":        uinput.KEY_TAB,
+    "KEY_U":          uinput.KEY_U,
+    "KEY_DELETE":     uinput.KEY_DELETE,
+    "KEY_COMMA":      uinput.KEY_COMMA,
+    "KEY_PERIOD":     uinput.KEY_PERIOD,
+    "KEY_SLASH":      uinput.KEY_SLASH,
+    "KEY_N":          uinput.KEY_N,
+    "KEY_M":          uinput.KEY_M,
+}
+
 class VirtualInput:
-    """Injects keyboard events via uinput (kernel-level, works in VR/Wayland)."""
-
-    KEY_MAP = {
-        "KEY_RIGHTBRACE": uinput.KEY_RIGHTBRACE,
-        "KEY_LEFTBRACE":  uinput.KEY_LEFTBRACE,
-        "KEY_COMMA":      uinput.KEY_COMMA,
-        "KEY_PERIOD":     uinput.KEY_PERIOD,
-        "KEY_SLASH":      uinput.KEY_SLASH,
-        "KEY_N":          uinput.KEY_N,
-        "KEY_M":          uinput.KEY_M,
-    }
-
-    def __init__(self, keys_needed: list[str]):
-        keys = [self.KEY_MAP[k] for k in keys_needed if k in self.KEY_MAP]
-        self._dev = uinput.Device(keys, name="ed-macro-virtual-kbd")
-        self._key_map = self.KEY_MAP
+    def __init__(self):
+        self._dev = uinput.Device(list(KEY_MAP.values()), name="ed-macro-virtual-kbd")
         log.info("Virtual keyboard created")
 
     def tap(self, key_name: str, hold_ms: int = 50):
-        key = self._key_map.get(key_name)
+        key = KEY_MAP.get(key_name)
         if not key:
             log.warning(f"Unknown key: {key_name}")
             return
+        import time
         self._dev.emit(key, 1)
-        import time; time.sleep(hold_ms / 1000)
+        time.sleep(hold_ms / 1000)
         self._dev.emit(key, 0)
 
     def close(self):
         self._dev.destroy()
 
 
+# ---------------------------------------------------------------------------
+# Gauss stagger autofire
+# ---------------------------------------------------------------------------
+
 class GaussAutofireLoop:
     """
-    Stagger-fires 3 Gauss groups while the physical trigger is held.
+    Cycles fire groups every charge_hold_ms while the physical trigger is held.
+    ED reads the trigger directly — daemon only injects the cycle_group_key.
 
-    ED reads the physical trigger directly (no injection needed for the shot).
-    Daemon only injects the "Next Fire Group" key every charge_hold_ms.
-
-    Timeline with 3 groups, 1300ms charge:
-      t=0.0s   trigger held, group 1 starts charging
-      t=1.3s   group 1 fires → daemon cycles to group 2
-      t=2.6s   group 2 fires → daemon cycles to group 3
-      t=3.9s   group 3 fires → daemon cycles to group 1
-      (repeat)
+    Timeline (3 groups, 1300ms):
+      t=0.0s  trigger held, group 1 starts charging
+      t=1.3s  group 1 fires → cycle to group 2
+      t=2.6s  group 2 fires → cycle to group 3
+      t=3.9s  group 3 fires → cycle to group 1  (repeat)
     """
 
-    def __init__(self, cfg: dict, vinput: VirtualInput):
-        self.cfg = cfg
+    def __init__(self, profile: dict, vinput: VirtualInput):
+        self.cfg = profile["autofire"]
         self.vinput = vinput
         self._task: asyncio.Task | None = None
+
+    def reload(self, profile: dict):
+        self.cfg = profile["autofire"]
 
     @property
     def running(self):
@@ -100,24 +128,25 @@ class GaussAutofireLoop:
         log.info("Autofire STOP")
 
     async def _loop(self):
-        charge_s = self.cfg["charge_hold_ms"] / 1000
+        charge_s  = self.cfg["charge_hold_ms"] / 1000
+        inter_s   = self.cfg.get("inter_shot_ms", 150) / 1000
         cycle_key = self.cfg["cycle_group_key"]
-
-        # Wait for first charge, then cycle repeatedly
         await asyncio.sleep(charge_s)
         while True:
             self.vinput.tap(cycle_key, hold_ms=50)
-            log.debug(f"Fire group cycled")
-            await asyncio.sleep(charge_s)
+            log.debug("Fire group cycled")
+            await asyncio.sleep(charge_s + inter_s)
 
+
+# ---------------------------------------------------------------------------
+# Joystick watcher
+# ---------------------------------------------------------------------------
 
 class StickWatcher:
-    """Reads evdev events from one joystick and calls registered callbacks."""
-
     def __init__(self, device_path: str, label: str, callbacks: dict):
         self.dev = evdev.InputDevice(device_path)
         self.label = label
-        self.callbacks = callbacks  # {button_code: {"down": coro_fn, "up": coro_fn}}
+        self.callbacks = callbacks   # {button_code: {"down": coro, "up": coro}}
         log.info(f"Watching {label}: {self.dev.name}")
 
     async def run(self):
@@ -133,19 +162,17 @@ class StickWatcher:
                 asyncio.create_task(cb["up"]())
 
 
-class VoiceListener:
-    """
-    Push-to-talk voice recognition via faster-whisper (CUDA).
-    PTT: hold configured button → speak → release → transcribe → dispatch.
-    Always-on: set ptt_enabled: false in config (uses voice activity detection).
-    """
+# ---------------------------------------------------------------------------
+# Voice listener (faster-whisper + PTT)
+# ---------------------------------------------------------------------------
 
-    def __init__(self, cfg: dict, command_handler):
-        self.cfg = cfg
+class VoiceListener:
+    def __init__(self, app_cfg: dict, command_handler):
+        self.cfg = app_cfg["voice"]
         self.handler = command_handler
         self._listening = False
         self._frames: list = []
-        self._model = None  # loaded lazily on first use
+        self._model = None
 
     def _get_model(self):
         if self._model is None:
@@ -155,7 +182,7 @@ class VoiceListener:
                 device=self.cfg["compute_device"],
                 compute_type="float16",
             )
-            log.info(f"Whisper model loaded: {self.cfg['model']}")
+            log.info(f"Whisper loaded: {self.cfg['model']}")
         return self._model
 
     async def ptt_down(self):
@@ -167,28 +194,23 @@ class VoiceListener:
     async def ptt_up(self):
         self._listening = False
         log.info("PTT: processing")
-        # Give the record loop one tick to finish
         await asyncio.sleep(0.05)
         await self._transcribe_and_dispatch()
 
     async def _record(self):
         import sounddevice as sd
         import numpy as np
-        SAMPLE_RATE = 16000
-        CHUNK = 1024
-
-        # Find Valve Index HMD mic
+        RATE, CHUNK = 16000, 1024
         devices = sd.query_devices()
-        mic_idx = None
-        for i, d in enumerate(devices):
-            if "Valve VR Radio" in d["name"] and d["max_input_channels"] > 0:
-                mic_idx = i
-                break
+        mic_idx = next(
+            (i for i, d in enumerate(devices)
+             if "Valve VR Radio" in d["name"] and d["max_input_channels"] > 0),
+            None
+        )
         if mic_idx is None:
-            log.warning("Valve Index mic not found — falling back to default")
-
-        with sd.InputStream(samplerate=SAMPLE_RATE, channels=1,
-                            device=mic_idx, blocksize=CHUNK, dtype="float32") as stream:
+            log.warning("Valve Index mic not found — using default")
+        with sd.InputStream(samplerate=RATE, channels=1, device=mic_idx,
+                            blocksize=CHUNK, dtype="float32") as stream:
             while self._listening:
                 chunk, _ = stream.read(CHUNK)
                 self._frames.append(chunk)
@@ -199,9 +221,8 @@ class VoiceListener:
             return
         import numpy as np
         audio = np.concatenate(self._frames).flatten()
-        if len(audio) < 3200:  # < 0.2s — too short, skip
+        if len(audio) < 3200:
             return
-
         loop = asyncio.get_running_loop()
         text = await loop.run_in_executor(None, self._run_whisper, audio)
         if text:
@@ -209,59 +230,121 @@ class VoiceListener:
             await self.handler(text)
 
     def _run_whisper(self, audio):
-        import numpy as np
         model = self._get_model()
         segments, _ = model.transcribe(audio, language="en")
         return " ".join(s.text for s in segments).strip().lower()
 
 
-class CommandHandler:
-    def __init__(self, autofire: GaussAutofireLoop, cfg: dict):
+# ---------------------------------------------------------------------------
+# Command dispatcher (profile-aware, hot-reloadable)
+# ---------------------------------------------------------------------------
+
+class CommandDispatcher:
+    def __init__(self, autofire: GaussAutofireLoop, profile_manager):
         self.autofire = autofire
-        self.cfg = cfg
+        self.pm = profile_manager
+        self._commands: list[dict] = []
+
+    def reload(self, profile: dict):
+        self._commands = profile.get("commands", [])
 
     async def __call__(self, text: str):
-        for name, cmd in self.cfg["voice"]["commands"].items():
+        for cmd in self._commands:
             if any(p in text for p in cmd["phrases"]):
                 action = cmd["action"]
-                log.info(f"Command matched: {name} → {action}")
+                log.info(f"Command: {cmd['name']} → {action}")
                 if action == "stop_autofire":
                     await self.autofire.stop()
+                elif action == "load_profile":
+                    await self.pm.switch(cmd["profile"])
                 elif action == "keypress":
-                    pass  # TODO: inject cmd["key"] via vinput
+                    self.autofire.vinput.tap(cmd["key"])
                 return
-        log.debug(f"No command matched: '{text}'")
+        log.debug(f"No match: '{text}'")
 
+
+# ---------------------------------------------------------------------------
+# Profile manager (hot-swap)
+# ---------------------------------------------------------------------------
+
+class ProfileManager:
+    def __init__(self, app_cfg: dict, autofire: GaussAutofireLoop,
+                 dispatcher: CommandDispatcher):
+        self.app_cfg    = app_cfg
+        self.autofire   = autofire
+        self.dispatcher = dispatcher
+        self._current   = ""
+
+    async def switch(self, name: str):
+        if name == self._current:
+            return
+        log.info(f"Loading profile: {name}")
+        try:
+            profile = load_profile(name)
+        except FileNotFoundError as e:
+            log.error(e)
+            return
+        await self.autofire.stop()
+        self.autofire.reload(profile)
+        self.dispatcher.reload(profile)
+        self._current = name
+        ACTIVE_PROFILE_PATH.write_text(name + "\n")
+        log.info(f"Profile active: {profile['name']}")
+
+    async def watch(self):
+        """Poll active_profile file and hot-swap on change."""
+        while True:
+            await asyncio.sleep(1)
+            name = read_active_profile_name()
+            if name != self._current:
+                await self.switch(name)
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 
 async def main():
-    cfg = load_config()
-    af_cfg = cfg["autofire"]
-    voice_cfg = cfg["voice"]
+    logging.basicConfig(level=logging.INFO,
+                        format="%(asctime)s %(levelname)s %(message)s")
 
-    vinput = VirtualInput([af_cfg["cycle_group_key"]])
-    autofire = GaussAutofireLoop(af_cfg, vinput)
-    handler = CommandHandler(autofire, cfg)
-    voice = VoiceListener(voice_cfg, handler)
+    app_cfg = load_app_config()
+    active  = read_active_profile_name()
+    profile = load_profile(active)
+
+    vinput     = VirtualInput()
+    autofire   = GaussAutofireLoop(profile, vinput)
+    dispatcher = CommandDispatcher(autofire, None)   # pm injected below
+    pm         = ProfileManager(app_cfg, autofire, dispatcher)
+    dispatcher.pm = pm
+    dispatcher.reload(profile)
+    pm._current = active
+
+    voice = VoiceListener(app_cfg, dispatcher)
+
+    dev_map = app_cfg["devices"]
+    af_cfg  = profile["autofire"]
+    v_cfg   = app_cfg["voice"]
 
     trigger_code = getattr(ecodes, af_cfg["trigger_button"])
-    ptt_code     = getattr(ecodes, voice_cfg["ptt_button"])
+    ptt_code     = getattr(ecodes, v_cfg["ptt_button"])
 
     callbacks = {
         trigger_code: {"down": autofire.start, "up": autofire.stop},
         ptt_code:     {"down": voice.ptt_down, "up": voice.ptt_up},
     }
 
-    device_map = cfg["devices"]
-    trigger_dev = device_map[af_cfg["trigger_device"]]
-
-    watcher = StickWatcher(trigger_dev, af_cfg["trigger_device"], callbacks)
+    trigger_dev = dev_map[af_cfg["trigger_device"]]
+    watcher     = StickWatcher(trigger_dev, af_cfg["trigger_device"], callbacks)
 
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, lambda: asyncio.create_task(_shutdown(autofire, vinput)))
+        loop.add_signal_handler(
+            sig, lambda: asyncio.create_task(_shutdown(autofire, vinput))
+        )
 
-    log.info("ED macro daemon ready — hold trigger to autofire, PTT for voice")
-    await watcher.run()
+    log.info(f"ED macro daemon ready — profile: {profile['name']}")
+    await asyncio.gather(watcher.run(), pm.watch())
 
 
 async def _shutdown(autofire, vinput):
