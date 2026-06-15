@@ -52,16 +52,36 @@ def read_active_profile_name() -> str:
 # ---------------------------------------------------------------------------
 
 KEY_MAP = {
-    "KEY_RIGHTBRACE": uinput.KEY_RIGHTBRACE,
-    "KEY_LEFTBRACE":  uinput.KEY_LEFTBRACE,
-    "KEY_TAB":        uinput.KEY_TAB,
+    # Fire group cycling
+    "KEY_T":          uinput.KEY_T,
+    "KEY_R":          uinput.KEY_R,
+    # Weapons / defense
     "KEY_U":          uinput.KEY_U,
+    "KEY_V":          uinput.KEY_V,
+    "KEY_LEFTBRACE":  uinput.KEY_LEFTBRACE,
+    "KEY_RIGHTBRACE": uinput.KEY_RIGHTBRACE,
+    "KEY_BACKSLASH":  uinput.KEY_BACKSLASH,
     "KEY_DELETE":     uinput.KEY_DELETE,
-    "KEY_COMMA":      uinput.KEY_COMMA,
-    "KEY_PERIOD":     uinput.KEY_PERIOD,
-    "KEY_SLASH":      uinput.KEY_SLASH,
-    "KEY_N":          uinput.KEY_N,
-    "KEY_M":          uinput.KEY_M,
+    "KEY_INSERT":     uinput.KEY_INSERT,
+    # Power
+    "KEY_UP":         uinput.KEY_UP,
+    "KEY_DOWN":       uinput.KEY_DOWN,
+    "KEY_LEFT":       uinput.KEY_LEFT,
+    "KEY_RIGHT":      uinput.KEY_RIGHT,
+    # Navigation
+    "KEY_TAB":        uinput.KEY_TAB,
+    "KEY_J":          uinput.KEY_J,
+    "KEY_F":          uinput.KEY_F,
+    "KEY_HOME":       uinput.KEY_HOME,
+    "KEY_G":          uinput.KEY_G,
+    "KEY_SEMICOLON":  uinput.KEY_SEMICOLON,
+    # Maps
+    "KEY_S":          uinput.KEY_S,
+    # Modifiers
+    "KEY_LEFTSHIFT":  uinput.KEY_LEFTSHIFT,
+    "KEY_RIGHTSHIFT": uinput.KEY_RIGHTSHIFT,
+    "KEY_LEFTALT":    uinput.KEY_LEFTALT,
+    "KEY_LEFTCTRL":   uinput.KEY_LEFTCTRL,
 }
 
 class VirtualInput:
@@ -78,6 +98,21 @@ class VirtualInput:
         self._dev.emit(key, 1)
         time.sleep(hold_ms / 1000)
         self._dev.emit(key, 0)
+
+    def combo(self, key_names: list[str], hold_ms: int = 50):
+        """Press modifier keys, tap the last key, release modifiers."""
+        import time
+        keys = [KEY_MAP.get(k) for k in key_names]
+        if any(k is None for k in keys):
+            log.warning(f"Unknown key in combo: {key_names}")
+            return
+        for k in keys[:-1]:
+            self._dev.emit(k, 1)
+        self._dev.emit(keys[-1], 1)
+        time.sleep(hold_ms / 1000)
+        self._dev.emit(keys[-1], 0)
+        for k in reversed(keys[:-1]):
+            self._dev.emit(k, 0)
 
     def close(self):
         self._dev.destroy()
@@ -259,6 +294,8 @@ class CommandDispatcher:
                     await self.pm.switch(cmd["profile"])
                 elif action == "keypress":
                     self.autofire.vinput.tap(cmd["key"])
+                elif action == "keypress_combo":
+                    self.autofire.vinput.combo(cmd["keys"])
                 return
         log.debug(f"No match: '{text}'")
 
